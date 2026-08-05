@@ -297,7 +297,7 @@ pub(crate) fn run_init(
     let use_keychain = if keychain {
         if !mesh_llm_identity::keychain_available() {
             bail!(
-                "No OS keychain backend is available on this host.\n\
+                "The configured daz-secrets provider is not available on this host.\n\
                  Retry without --keychain to set a passphrase, or with --no-passphrase \
                  to store keys unencrypted."
             );
@@ -351,7 +351,7 @@ pub(crate) fn run_init(
     match &source {
         PassphraseSource::Keychain { account } => {
             eprintln!(
-                "Unlock:          OS keychain (service={KEYCHAIN_SERVICE}, account={account})"
+                "Unlock:          daz-secrets provider (service={KEYCHAIN_SERVICE}, account={account})"
             );
         }
         PassphraseSource::Prompt => {
@@ -364,8 +364,8 @@ pub(crate) fn run_init(
     match &source {
         PassphraseSource::Keychain { account } => {
             eprintln!(
-                "- This keystore is unlock-bound to this machine's keychain. To share the same \
-                 owner identity on another node, retrieve the passphrase from your OS keychain \
+                "- This keystore is unlock-bound to the configured daz-secrets provider. To share the same \
+                 owner identity on another node, retrieve the passphrase from that provider \
                  (service={KEYCHAIN_SERVICE}, account={account}) and enter it there, or re-run \
                  `auth init` with a manual passphrase so the same passphrase can be used everywhere."
             );
@@ -421,7 +421,7 @@ pub(crate) fn run_status(
         if info.encrypted {
             match load_owner_keypair_from_keychain(&owner_key_path) {
                 Ok(_) => {
-                    eprintln!("Keystore:        valid (unlocked from OS keychain)");
+                    eprintln!("Keystore:        valid (unlocked from daz-secrets provider)");
                 }
                 Err(OwnerKeychainLoadError::Crypto(e)) => {
                     eprintln!(

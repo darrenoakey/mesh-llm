@@ -1,6 +1,5 @@
-//! Thin wrapper around `keyring` for storing the owner keystore unlock secret
-//! in the OS-native credential store (macOS Keychain, Windows Credential
-//! Manager, Linux Secret Service).
+//! Compatibility wrapper for storing the owner keystore unlock secret through
+//! the configured `daz-secrets` provider.
 //!
 //! This module is backend-neutral: it stores and retrieves opaque UTF-8
 //! strings by (service, account) key. Callers decide whether the stored value
@@ -9,14 +8,14 @@
 use std::path::Path;
 
 use base64::Engine as _;
-use keyring::Entry;
+use daz_secrets::{BlockingClient, Error as SecretError, ErrorCode};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use super::keystore::{load_keystore, save_keystore, write_keystore_bytes_atomically};
 use super::{CryptoError, OwnerKeypair};
 
-/// Service name used for all mesh-llm keychain entries.
+/// Service name used for all mesh-llm provider entries.
 pub const KEYCHAIN_SERVICE: &str = "mesh-llm";
 
 /// Default account name for the owner keystore unlock secret.
@@ -28,68 +27,55 @@ pub enum OwnerKeychainLoadError {
     Crypto(CryptoError),
 }
 
-/// Store a secret in the OS keychain under (service, account).
+/// Store a secret through the configured provider under (service, account).
 ///
 /// Overwrites any existing entry with the same (service, account) pair.
 pub fn set_secret(service: &str, account: &str, secret: &str) -> Result<(), CryptoError> {
-    let entry = Entry::new(service, account).map_err(map_err)?;
-    entry.set_password(secret).map_err(map_err)
+    secret_client()?
+        .set(service, account, secret.as_bytes(), None)
+        .map(|_| ())
+        .map_err(map_err)
 }
 
-/// Retrieve a secret from the OS keychain by (service, account).
+/// Retrieve a secret through the configured provider by (service, account).
 ///
 /// Returns `Ok(None)` when no entry exists for the given pair. Returns
-/// `Err(CryptoError)` when the keychain backend is unavailable or errored.
+/// `Err(CryptoError)` when the configured provider is unavailable or errored.
 pub fn get_secret(service: &str, account: &str) -> Result<Option<String>, CryptoError> {
-    let entry = Entry::new(service, account).map_err(map_err)?;
-    match entry.get_password() {
-        Ok(s) => Ok(Some(s)),
-        Err(keyring::Error::NoEntry) => Ok(None),
+    match secret_client()?.get(service, account) {
+        Ok(secret) => String::from_utf8(secret.value)
+            .map(Some)
+            .map_err(|_| unavailable("provider returned a non-UTF-8 secret")),
+        Err(error) if error.code() == ErrorCode::NotFound => Ok(None),
         Err(e) => Err(map_err(e)),
     }
 }
 
-/// Delete a secret from the OS keychain by (service, account).
+/// Delete a secret through the configured provider by (service, account).
 ///
 /// Returns `Ok(false)` when no entry existed to delete, `Ok(true)` when an
 /// entry was removed.
 pub fn delete_secret(service: &str, account: &str) -> Result<bool, CryptoError> {
-    let entry = Entry::new(service, account).map_err(map_err)?;
-    match entry.delete_credential() {
+    match secret_client()?.delete(service, account, None) {
         Ok(()) => Ok(true),
-        Err(keyring::Error::NoEntry) => Ok(false),
+        Err(error) if error.code() == ErrorCode::NotFound => Ok(false),
         Err(e) => Err(map_err(e)),
     }
 }
 
-/// Probe whether a native keychain backend is reachable on this host.
-///
-/// On Linux this typically means a Secret Service daemon (gnome-keyring,
-/// KWallet) is running and reachable over D-Bus. On macOS and Windows the
-/// backend is effectively always available.
-///
-/// Implementation: attempts a read on a probe account. `NoEntry` counts as
-/// available (the backend answered). A `PlatformFailure` or similar counts as
-/// unavailable.
+/// Probe whether the configured secret provider is reachable on this host.
 pub fn is_available() -> bool {
-    const PROBE_ACCOUNT: &str = "__availability-probe__";
-    let entry = match Entry::new(KEYCHAIN_SERVICE, PROBE_ACCOUNT) {
-        Ok(e) => e,
-        Err(_) => return false,
-    };
-    match entry.get_password() {
-        Ok(_) => true,
-        Err(keyring::Error::NoEntry) => true,
-        Err(_) => false,
-    }
+    secret_client()
+        .and_then(|client| client.info().map_err(map_err))
+        .is_ok()
 }
 
-/// Derive a stable keychain account name from a keystore path.
+/// Derive a stable provider account name from a keystore path.
 ///
 /// Form: `owner-keystore:<16 hex chars of sha256(normalized_absolute_path)>`.
 /// The prefix matches `DEFAULT_OWNER_ACCOUNT` so users can identify mesh-llm
 /// entries. The hash bounds the length and avoids leaking full paths into
-/// keychain account fields, while still giving every keystore path its own
+/// provider account fields, while still giving every keystore path its own
 /// slot.
 ///
 /// Uses `std::path::absolute` rather than `canonicalize` so the result is
@@ -100,7 +86,7 @@ pub fn is_available() -> bool {
 ///
 /// On Windows the path is lowercased before hashing, because the default
 /// filesystem (NTFS) is case-insensitive; without this, `Owner-Keystore.json`
-/// and `owner-keystore.json` would map to different keychain entries despite
+/// and `owner-keystore.json` would map to different provider entries despite
 /// being the same file.
 pub fn owner_account_for_path(path: &Path) -> String {
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
@@ -114,11 +100,11 @@ pub fn owner_account_for_path(path: &Path) -> String {
 }
 
 /// Save an owner keystore encrypted with a random passphrase and bind that
-/// passphrase to the OS keychain account derived from `path`.
+/// passphrase to the provider account derived from `path`.
 ///
-/// The keystore is written before the keychain is updated. If the keychain
+/// The keystore is written before the provider is updated. If the provider
 /// write fails, the keystore is restored to its previous bytes (or removed if
-/// it did not exist), so ordinary failures do not strand the file and keychain
+/// it did not exist), so ordinary failures do not strand the file and provider
 /// in different states.
 pub fn save_keystore_with_keychain(
     path: &Path,
@@ -131,7 +117,7 @@ pub fn save_keystore_with_keychain(
     } else {
         None
     };
-    // Snapshot any existing keychain entry so rollback is symmetric: if
+    // Snapshot any existing provider entry so rollback is symmetric: if
     // set_secret partially modifies or clears the entry before failing, we
     // restore the original secret (or delete the entry if there was none).
     let previous_keychain = get_secret(KEYCHAIN_SERVICE, &account)?;
@@ -148,8 +134,8 @@ pub fn save_keystore_with_keychain(
     Ok(account)
 }
 
-/// Try to load an encrypted keystore using a passphrase stored in the OS
-/// keychain under the account derived from the keystore path.
+/// Try to load an encrypted keystore using a passphrase stored by the
+/// configured provider under the account derived from the keystore path.
 pub fn load_owner_keypair_from_keychain(
     path: &Path,
 ) -> Result<OwnerKeypair, OwnerKeychainLoadError> {
@@ -169,14 +155,23 @@ pub fn load_owner_keypair_from_keychain(
     load_keystore(path, Some(pass.as_str())).map_err(OwnerKeychainLoadError::Crypto)
 }
 
-fn map_err(e: keyring::Error) -> CryptoError {
-    match e {
-        keyring::Error::NoStorageAccess(err) => CryptoError::KeychainAccessDenied {
-            reason: err.to_string(),
-        },
-        other => CryptoError::KeychainUnavailable {
-            reason: other.to_string(),
-        },
+fn secret_client() -> Result<BlockingClient, CryptoError> {
+    BlockingClient::from_default_config().map_err(map_err)
+}
+
+fn map_err(error: SecretError) -> CryptoError {
+    if error.code() == ErrorCode::Denied {
+        CryptoError::KeychainAccessDenied {
+            reason: error.to_string(),
+        }
+    } else {
+        unavailable(&error.to_string())
+    }
+}
+
+fn unavailable(reason: &str) -> CryptoError {
+    CryptoError::KeychainUnavailable {
+        reason: reason.to_owned(),
     }
 }
 
@@ -197,7 +192,7 @@ fn rollback_keystore(path: &Path, previous_keystore: Option<&[u8]>) -> Result<()
     }
 }
 
-/// Restore a keychain entry to its previous state.
+/// Restore a provider entry to its previous state.
 ///
 /// If `previous` is `Some`, the secret is written back; if `None`, the entry
 /// is deleted so no orphan is left behind.
@@ -220,11 +215,14 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
-    // Keychain tests hit the real OS credential store, so use a unique account
-    // per test run and clean up afterward. They run serially because some
-    // backends (e.g. Windows Credential Manager) don't handle concurrent
-    // mutations from the same process cleanly. Tests skip themselves when
-    // no keychain backend is reachable (e.g. CI without a Secret Service).
+    // Provider tests run against the real configured provider, so they never
+    // touch the production `KEYCHAIN_SERVICE` namespace: each test uses its own
+    // disposable service name plus a unique account, and removes only the
+    // entries it created.
+    fn test_service() -> String {
+        format!("{KEYCHAIN_SERVICE}-test-{}", rand::random::<u64>())
+    }
+
     fn test_account(tag: &str) -> String {
         format!("test-{}-{}", tag, rand::random::<u64>())
     }
@@ -233,20 +231,21 @@ mod tests {
     #[serial]
     fn round_trip_set_get_delete() {
         if !is_available() {
-            eprintln!("keychain backend unavailable, skipping");
+            eprintln!("secret provider unavailable, skipping");
             return;
         }
+        let service = test_service();
         let account = test_account("round-trip");
         let secret = "correct horse battery staple";
 
-        set_secret(KEYCHAIN_SERVICE, &account, secret).unwrap();
-        let got = get_secret(KEYCHAIN_SERVICE, &account).unwrap();
+        set_secret(&service, &account, secret).unwrap();
+        let got = get_secret(&service, &account).unwrap();
         assert_eq!(got.as_deref(), Some(secret));
 
-        let removed = delete_secret(KEYCHAIN_SERVICE, &account).unwrap();
+        let removed = delete_secret(&service, &account).unwrap();
         assert!(removed);
 
-        let after = get_secret(KEYCHAIN_SERVICE, &account).unwrap();
+        let after = get_secret(&service, &account).unwrap();
         assert_eq!(after, None);
     }
 
@@ -254,11 +253,12 @@ mod tests {
     #[serial]
     fn get_missing_entry_returns_none() {
         if !is_available() {
-            eprintln!("keychain backend unavailable, skipping");
+            eprintln!("secret provider unavailable, skipping");
             return;
         }
+        let service = test_service();
         let account = test_account("missing");
-        let got = get_secret(KEYCHAIN_SERVICE, &account).unwrap();
+        let got = get_secret(&service, &account).unwrap();
         assert_eq!(got, None);
     }
 
@@ -266,11 +266,12 @@ mod tests {
     #[serial]
     fn delete_missing_entry_returns_false() {
         if !is_available() {
-            eprintln!("keychain backend unavailable, skipping");
+            eprintln!("secret provider unavailable, skipping");
             return;
         }
+        let service = test_service();
         let account = test_account("delete-missing");
-        let removed = delete_secret(KEYCHAIN_SERVICE, &account).unwrap();
+        let removed = delete_secret(&service, &account).unwrap();
         assert!(!removed);
     }
 
@@ -278,17 +279,18 @@ mod tests {
     #[serial]
     fn overwrite_existing_entry() {
         if !is_available() {
-            eprintln!("keychain backend unavailable, skipping");
+            eprintln!("secret provider unavailable, skipping");
             return;
         }
+        let service = test_service();
         let account = test_account("overwrite");
-        set_secret(KEYCHAIN_SERVICE, &account, "first").unwrap();
-        set_secret(KEYCHAIN_SERVICE, &account, "second").unwrap();
+        set_secret(&service, &account, "first").unwrap();
+        set_secret(&service, &account, "second").unwrap();
 
-        let got = get_secret(KEYCHAIN_SERVICE, &account).unwrap();
+        let got = get_secret(&service, &account).unwrap();
         assert_eq!(got.as_deref(), Some("second"));
 
-        delete_secret(KEYCHAIN_SERVICE, &account).ok();
+        delete_secret(&service, &account).ok();
     }
 
     #[test]
