@@ -754,7 +754,7 @@ Subcommands:
 - `--owner-key <OWNER_KEY>`: keystore path.
 - `--force`: overwrite existing keystore.
 - `--no-passphrase`: leave keys unencrypted.
-- `--keychain`: store random unlock passphrase in OS keychain.
+- `--keychain`: compatibility spelling that stores a random unlock passphrase through the configured `daz-secrets` provider.
 
 `auth status` switches:
 

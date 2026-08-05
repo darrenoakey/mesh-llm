@@ -73,6 +73,7 @@ ahash = "0.8.12"
 anyhow = "1"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
+daz-secrets = { git = "https://github.com/darrenoakey/daz-secrets", rev = "ef01d96a2fa8d661a6a2ad7dace77fce0f2f60aa" }
 mesh-llm-build-info = { path = "crates/mesh-llm-build-info", version = "0.74.0" }
 mesh-llm-skills = { path = "crates/mesh-llm-skills", version = "0.74.0" }
 serde = { version = "1", features = ["derive"] }
