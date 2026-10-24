@@ -19,9 +19,11 @@ pub(in crate::evals) fn terminal_bench_command(args: &EvalRunArgs, run_dir: &Pat
             args.timeout_secs.to_string(),
             "--global-test-timeout-sec".to_string(),
             "60".to_string(),
-            "--no-upload-results".to_string(),
-            "--no-livestream".to_string(),
         ])
+        // `tb` (terminal-bench >= 0.2.x) defaults `--upload-results` and
+        // `--livestream` to off, so no extra flags are needed to keep runs
+        // local and quiet; the removed `--no-*` variants no longer exist and
+        // made the CLI abort before running any task.
         .env("OPENAI_BASE_URL", args.base_url.clone())
         .secret_env("OPENAI_API_KEY", args.api_key.clone())
 }

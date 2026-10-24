@@ -281,7 +281,38 @@ pub(super) fn swe_bench_pro_metrics(run_dir: &Path) -> Result<EvalMetrics> {
     metrics.prompt_tokens = sum_nested_usage(rows, "prompt_tokens");
     metrics.completion_tokens = sum_nested_usage(rows, "completion_tokens");
     metrics.total_tokens = sum_nested_usage(rows, "total_tokens");
+    if let Some((resolved, total)) = swe_bench_pro_flat_instance_outcomes(&value) {
+        // Upstream swe_bench_pro_eval.py writes eval_results.json as a flat
+        // {instance_id: bool} mapping; derive the score counts from it.
+        metrics.request_count = Some(total);
+        metrics.failed_count = Some(total - resolved);
+        metrics.pass_rate = (total > 0).then_some(resolved as f64 / total as f64);
+    }
     Ok(metrics)
+}
+
+fn swe_bench_pro_flat_instance_outcomes(value: &Value) -> Option<(u64, u64)> {
+    let entries = value
+        .as_object()?
+        .iter()
+        .filter(|(key, _)| {
+            key.as_str() != "rows" && key.as_str() != "usage" && key.as_str() != "summary"
+        });
+    let mut total = 0_u64;
+    let mut resolved = 0_u64;
+    for (_, outcome) in entries {
+        let passed = outcome.as_bool().or_else(|| {
+            outcome
+                .get("resolved")
+                .or_else(|| outcome.get("passed"))
+                .and_then(Value::as_bool)
+        })?;
+        total += 1;
+        if passed {
+            resolved += 1;
+        }
+    }
+    (total > 0).then_some((resolved, total))
 }
 
 fn swe_bench_pro_request_count(value: &Value, rows: &[Value]) -> Option<u64> {
@@ -346,14 +377,29 @@ pub(super) fn terminal_bench_metrics(run_dir: &Path) -> Result<EvalMetrics> {
 
 fn terminal_bench_results_path(run_dir: &Path) -> Result<PathBuf> {
     let root = terminal_bench_output_path(run_dir);
+    // `tb run --output-path <root>` writes <root>/<run-id>/results.json; when a
+    // run id is supplied explicitly the file sits directly under <root>.
+    let direct = root.join("results.json");
+    if direct.is_file() {
+        return Ok(direct);
+    }
+    let mut candidates = Vec::new();
     for entry in fs::read_dir(&root).with_context(|| format!("read {}", root.display()))? {
         let entry = entry?;
         let path = entry.path().join("results.json");
         if path.is_file() {
-            return Ok(path);
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            candidates.push((modified, path));
         }
     }
-    bail!("no Terminal-Bench results.json under {}", root.display())
+    candidates.sort_by_key(|(modified, _)| *modified);
+    candidates
+        .pop()
+        .map(|(_, path)| path)
+        .with_context(|| format!("no Terminal-Bench results.json under {}", root.display()))
 }
 
 fn mcp_atlas_metrics(run_dir: &Path) -> Result<EvalMetrics> {

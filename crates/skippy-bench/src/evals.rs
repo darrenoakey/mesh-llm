@@ -614,6 +614,8 @@ mod tests {
         );
         assert!(!command.args.contains(&"--task-id".to_string()));
         assert!(command.args.contains(&"--output-path".to_string()));
+        assert!(!command.args.contains(&"--no-upload-results".to_string()));
+        assert!(!command.args.contains(&"--no-livestream".to_string()));
         assert!(
             command
                 .envs
@@ -908,6 +910,30 @@ mod tests {
     }
 
     #[test]
+    fn swe_bench_pro_metrics_parse_upstream_flat_instance_outcomes() {
+        // swe_bench_pro_eval.py (Scale SWE-bench_Pro-os) writes eval_results.json
+        // as a flat {instance_id: bool} mapping.
+        let run_dir = temp_run_dir("swe-metrics-flat");
+        fs::create_dir_all(swe_bench_pro_output_path(&run_dir).parent().unwrap()).unwrap();
+        fs::write(
+            swe_bench_pro_output_path(&run_dir),
+            r#"{
+              "repo__app-1": true,
+              "repo__app-2": false,
+              "repo__app-3": true,
+              "repo__app-4": true
+            }"#,
+        )
+        .unwrap();
+
+        let metrics = swe_bench_pro_metrics(&run_dir).unwrap();
+        assert_eq!(metrics.request_count, Some(4));
+        assert_eq!(metrics.failed_count, Some(1));
+        assert_eq!(metrics.pass_rate, Some(0.75));
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
     fn terminal_bench_metrics_extract_accuracy_and_tokens() {
         let run_dir = temp_run_dir("terminal-metrics");
         let result_dir = terminal_bench_output_path(&run_dir).join("run-id");
@@ -937,6 +963,74 @@ mod tests {
         assert_eq!(metrics.prompt_tokens, Some(100));
         assert_eq!(metrics.completion_tokens, Some(25));
         assert_eq!(metrics.total_tokens, Some(125));
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn terminal_bench_metrics_prefer_the_newest_run_directory() {
+        let run_dir = temp_run_dir("terminal-metrics-newest");
+        let stale_dir = terminal_bench_output_path(&run_dir).join("2026-01-01__00-00-00");
+        let fresh_dir = terminal_bench_output_path(&run_dir).join("2026-06-01__00-00-00");
+        fs::create_dir_all(&stale_dir).unwrap();
+        fs::create_dir_all(&fresh_dir).unwrap();
+        fs::write(
+            stale_dir.join("results.json"),
+            r#"{"results": [], "n_resolved": 0, "n_unresolved": 1, "accuracy": 0.0}"#,
+        )
+        .unwrap();
+        // Ensure the fresh file has a strictly newer mtime regardless of
+        // filesystem timestamp granularity.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(
+            fresh_dir.join("results.json"),
+            r#"{
+              "results": [
+                {
+                  "task_id": "hello-world",
+                  "is_resolved": true,
+                  "total_input_tokens": 10,
+                  "total_output_tokens": 5
+                }
+              ],
+              "n_resolved": 1,
+              "n_unresolved": 0,
+              "accuracy": 1.0
+            }"#,
+        )
+        .unwrap();
+
+        let metrics = terminal_bench_metrics(&run_dir).unwrap();
+        assert_eq!(metrics.request_count, Some(1));
+        assert_eq!(metrics.pass_rate, Some(1.0));
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn terminal_bench_metrics_read_results_directly_under_output_root() {
+        let run_dir = temp_run_dir("terminal-metrics-direct");
+        fs::create_dir_all(terminal_bench_output_path(&run_dir)).unwrap();
+        fs::write(
+            terminal_bench_output_path(&run_dir).join("results.json"),
+            r#"{
+              "results": [
+                {
+                  "task_id": "hello-world",
+                  "is_resolved": false,
+                  "total_input_tokens": 8,
+                  "total_output_tokens": 2
+                }
+              ],
+              "n_resolved": 0,
+              "n_unresolved": 1,
+              "accuracy": 0.0
+            }"#,
+        )
+        .unwrap();
+
+        let metrics = terminal_bench_metrics(&run_dir).unwrap();
+        assert_eq!(metrics.request_count, Some(1));
+        assert_eq!(metrics.failed_count, Some(1));
+        assert_eq!(metrics.pass_rate, Some(0.0));
         let _ = fs::remove_dir_all(run_dir);
     }
 
